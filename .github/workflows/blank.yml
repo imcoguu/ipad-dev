@@ -44,6 +44,8 @@ jobs:
         run: |
           set -euo pipefail
           brew install xcodegen
+          python3 -m pip install --upgrade pip
+          python3 -m pip install gdown
           rustup toolchain install 1.98.1 --profile minimal
           rustup target add aarch64-apple-ios --toolchain 1.98.1
 
@@ -57,7 +59,6 @@ jobs:
           MUSH8_PROD_KEYS_URL: ${{ secrets.MUSH8_PROD_KEYS_URL }}
           MUSH8_BASE_NSP_URL: ${{ secrets.MUSH8_BASE_NSP_URL }}
           MUSH8_UPDATE_NSP_URL: ${{ secrets.MUSH8_UPDATE_NSP_URL }}
-          MUSH8_ASSETS_TOKEN: ${{ secrets.MUSH8_ASSETS_TOKEN }}
         run: |
           set -euo pipefail
           cd mush8
@@ -68,25 +69,10 @@ jobs:
 
             echo "Downloading $output..."
 
-            if [[ -n "${MUSH8_ASSETS_TOKEN:-}" ]]; then
-              curl \
-                --fail \
-                --location \
-                --retry 3 \
-                --silent \
-                --show-error \
-                --header "Authorization: Bearer ${MUSH8_ASSETS_TOKEN}" \
-                "$url" \
-                --output "$output"
+            if [[ "$url" =~ ^https?:// ]]; then
+              python3 -m gdown --fuzzy "$url" -O "$output"
             else
-              curl \
-                --fail \
-                --location \
-                --retry 3 \
-                --silent \
-                --show-error \
-                "$url" \
-                --output "$output"
+              python3 -m gdown "$url" -O "$output"
             fi
 
             if [[ ! -s "$output" ]]; then
