@@ -2,11 +2,6 @@ name: Build Mush8 IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      assets_url:
-        description: 'Optional override for game-assets tar.gz URL (falls back to MUSH8_ASSETS_URL secret)'
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -24,18 +19,25 @@ jobs:
           set -euo pipefail
           git clone --depth 1 https://github.com/c22dev/mush8.git mush8
 
-      - name: Check required asset URL
+      - name: Check required asset URLs
         shell: bash
         env:
-          MUSH8_ASSETS_URL: ${{ inputs.assets_url || secrets.MUSH8_ASSETS_URL }}
+          MUSH8_PROD_KEYS_URL: ${{ secrets.MUSH8_PROD_KEYS_URL }}
+          MUSH8_BASE_NSP_URL: ${{ secrets.MUSH8_BASE_NSP_URL }}
+          MUSH8_UPDATE_NSP_URL: ${{ secrets.MUSH8_UPDATE_NSP_URL }}
         run: |
           set -euo pipefail
-          if [[ -z "$MUSH8_ASSETS_URL" ]]; then
-            echo "Missing assets URL."
-            echo "Provide workflow input 'assets_url' or repository secret MUSH8_ASSETS_URL."
-            echo "The archive must contain prod.keys, base.nsp, and upd4-0-1.nsp."
-            exit 1
-          fi
+
+          for name in \
+            MUSH8_PROD_KEYS_URL \
+            MUSH8_BASE_NSP_URL \
+            MUSH8_UPDATE_NSP_URL
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing repository secret: $name"
+              exit 1
+            fi
+          done
 
       - name: Install build tools
         shell: bash
@@ -44,6 +46,7 @@ jobs:
           brew install xcodegen
           rustup toolchain install 1.98.1 --profile minimal
           rustup target add aarch64-apple-ios --toolchain 1.98.1
+
           xcodebuild -version
           xcodegen version
           rustc +1.98.1 --version
@@ -51,30 +54,67 @@ jobs:
       - name: Download private game assets
         shell: bash
         env:
-          MUSH8_ASSETS_URL: ${{ inputs.assets_url || secrets.MUSH8_ASSETS_URL }}
+          MUSH8_PROD_KEYS_URL: ${{ secrets.MUSH8_PROD_KEYS_URL }}
+          MUSH8_BASE_NSP_URL: ${{ secrets.MUSH8_BASE_NSP_URL }}
+          MUSH8_UPDATE_NSP_URL: ${{ secrets.MUSH8_UPDATE_NSP_URL }}
           MUSH8_ASSETS_TOKEN: ${{ secrets.MUSH8_ASSETS_TOKEN }}
         run: |
           set -euo pipefail
           cd mush8
-          tmp_archive="$(mktemp -t mush8-assets.XXXXXX.tar.gz)"
-          if [[ -n "${MUSH8_ASSETS_TOKEN:-}" ]]; then
-            echo "::add-mask::$MUSH8_ASSETS_TOKEN"
-            curl --fail --location --retry 3 --silent --show-error \
-              -H "Authorization: ${MUSH8_ASSETS_TOKEN}" \
-              "$MUSH8_ASSETS_URL" -o "$tmp_archive"
-          else
-            curl --fail --location --retry 3 --silent --show-error \
-              "$MUSH8_ASSETS_URL" -o "$tmp_archive"
-          fi
-          tar -xzf "$tmp_archive"
-          rm -f "$tmp_archive"
-          for file in prod.keys base.nsp upd4-0-1.nsp; do
-            if [[ ! -f "$file" ]]; then
-              echo "Required asset missing from downloaded archive: $file"
+
+          download_asset() {
+            local url="$1"
+            local output="$2"
+
+            echo "Downloading $output..."
+
+            if [[ -n "${MUSH8_ASSETS_TOKEN:-}" ]]; then
+              curl \
+                --fail \
+                --location \
+                --retry 3 \
+                --silent \
+                --show-error \
+                --header "Authorization: Bearer ${MUSH8_ASSETS_TOKEN}" \
+                "$url" \
+                --output "$output"
+            else
+              curl \
+                --fail \
+                --location \
+                --retry 3 \
+                --silent \
+                --show-error \
+                "$url" \
+                --output "$output"
+            fi
+
+            if [[ ! -s "$output" ]]; then
+              echo "Downloaded file is empty: $output"
               exit 1
             fi
-          done
+          }
+
+          download_asset "$MUSH8_PROD_KEYS_URL" prod.keys
+          download_asset "$MUSH8_BASE_NSP_URL" base.nsp
+          download_asset "$MUSH8_UPDATE_NSP_URL" upd4-0-1.nsp
+
           chmod 600 prod.keys
+
+          for file in prod.keys base.nsp upd4-0-1.nsp; do
+            if [[ ! -f "$file" ]]; then
+              echo "Required asset missing: $file"
+              exit 1
+            fi
+
+            if [[ ! -s "$file" ]]; then
+              echo "Required asset is empty: $file"
+              exit 1
+            fi
+
+            echo "$file downloaded successfully:"
+            ls -lh "$file"
+          done
 
       - name: Build IPA
         working-directory: mush8
