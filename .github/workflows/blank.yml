@@ -64,17 +64,36 @@ jobs:
           set -euo pipefail
           cd mush8
 
+          normalize_gdrive_input() {
+            local input="$1"
+            local id=""
+
+            if [[ "$input" =~ ^https?://drive\.google\.com/file/d/([^/]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+            elif [[ "$input" =~ ^https?://drive\.google\.com/open\?id=([^&]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+            elif [[ "$input" =~ ^https?://drive\.google\.com/uc\?id=([^&]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+            elif [[ "$input" =~ ^https?:// && "$input" =~ [\?\&]id=([^&]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -n "$id" ]]; then
+              printf 'https://drive.google.com/uc?id=%s\n' "$id"
+            else
+              printf '%s\n' "$input"
+            fi
+          }
+
           download_asset() {
             local url="$1"
             local output="$2"
+            local source=""
 
             echo "Downloading $output..."
 
-            if [[ "$url" =~ ^https?:// ]]; then
-              "$RUNNER_TEMP/mush8-python/bin/python" -m gdown --fuzzy "$url" -O "$output"
-            else
-              "$RUNNER_TEMP/mush8-python/bin/python" -m gdown "$url" -O "$output"
-            fi
+            source="$(normalize_gdrive_input "$url")"
+            "$RUNNER_TEMP/mush8-python/bin/python" -m gdown "$source" -O "$output"
 
             if [[ ! -s "$output" ]]; then
               echo "Downloaded file is empty: $output"
