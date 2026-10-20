@@ -44,8 +44,9 @@ jobs:
         run: |
           set -euo pipefail
           brew install xcodegen
-          python3 -m pip install --upgrade pip
-          python3 -m pip install gdown
+          python3 -m venv "$RUNNER_TEMP/mush8-python"
+          "$RUNNER_TEMP/mush8-python/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/mush8-python/bin/python" -m pip install gdown
           rustup toolchain install 1.98.1 --profile minimal
           rustup target add aarch64-apple-ios --toolchain 1.98.1
 
@@ -70,9 +71,9 @@ jobs:
             echo "Downloading $output..."
 
             if [[ "$url" =~ ^https?:// ]]; then
-              python3 -m gdown --fuzzy "$url" -O "$output"
+              "$RUNNER_TEMP/mush8-python/bin/python" -m gdown --fuzzy "$url" -O "$output"
             else
-              python3 -m gdown "$url" -O "$output"
+              "$RUNNER_TEMP/mush8-python/bin/python" -m gdown "$url" -O "$output"
             fi
 
             if [[ ! -s "$output" ]]; then
