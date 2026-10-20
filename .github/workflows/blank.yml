@@ -1,0 +1,87 @@
+name: Build Mush8 IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    name: Build Mush8 for iOS
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone Mush8
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/c22dev/mush8.git mush8
+
+      - name: Check required asset URL
+        shell: bash
+        env:
+          MUSH8_ASSETS_URL: ${{ secrets.MUSH8_ASSETS_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MUSH8_ASSETS_URL" ]]; then
+            echo "Missing repository secret MUSH8_ASSETS_URL."
+            echo "It must point to a private tar.gz containing prod.keys, base.nsp, and upd4-0-1.nsp."
+            exit 1
+          fi
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          xcodebuild -version
+          xcodegen version
+          rustc +1.98.1 --version
+
+      - name: Download private game assets
+        shell: bash
+        env:
+          MUSH8_ASSETS_URL: ${{ secrets.MUSH8_ASSETS_URL }}
+          MUSH8_ASSETS_TOKEN: ${{ secrets.MUSH8_ASSETS_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd mush8
+          tmp_archive="$(mktemp -t mush8-assets.XXXXXX.tar.gz)"
+          if [[ -n "${MUSH8_ASSETS_TOKEN:-}" ]]; then
+            curl --fail --location --retry 3 --silent --show-error \
+              -H "Authorization: Bearer ${MUSH8_ASSETS_TOKEN}" \
+              "$MUSH8_ASSETS_URL" -o "$tmp_archive"
+          else
+            curl --fail --location --retry 3 --silent --show-error \
+              "$MUSH8_ASSETS_URL" -o "$tmp_archive"
+          fi
+          tar -xzf "$tmp_archive"
+          rm -f "$tmp_archive"
+          for file in prod.keys base.nsp upd4-0-1.nsp; do
+            if [[ ! -f "$file" ]]; then
+              echo "Required asset missing from downloaded archive: $file"
+              exit 1
+            fi
+          done
+          chmod 600 prod.keys
+
+      - name: Build IPA
+        working-directory: mush8
+        shell: bash
+        env:
+          BUNDLE_ID: com.imcoguu.mush8
+        run: |
+          set -euo pipefail
+          ./make-ios.sh --ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mush8-ipa
+          path: mush8/build/Mush8.ipa
+          if-no-files-found: error
+          retention-days: 7
