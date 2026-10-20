@@ -25,13 +25,15 @@ jobs:
           MUSH8_PROD_KEYS_URL: ${{ secrets.MUSH8_PROD_KEYS_URL }}
           MUSH8_BASE_NSP_URL: ${{ secrets.MUSH8_BASE_NSP_URL }}
           MUSH8_UPDATE_NSP_URL: ${{ secrets.MUSH8_UPDATE_NSP_URL }}
+          MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
 
           for name in \
             MUSH8_PROD_KEYS_URL \
             MUSH8_BASE_NSP_URL \
-            MUSH8_UPDATE_NSP_URL
+            MUSH8_UPDATE_NSP_URL \
+            MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON
           do
             if [[ -z "${!name:-}" ]]; then
               echo "Missing repository secret: $name"
@@ -46,7 +48,7 @@ jobs:
           brew install xcodegen
           python3 -m venv "$RUNNER_TEMP/mush8-python"
           "$RUNNER_TEMP/mush8-python/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/mush8-python/bin/python" -m pip install gdown
+          "$RUNNER_TEMP/mush8-python/bin/python" -m pip install gdown google-api-python-client
           rustup toolchain install 1.98.1 --profile minimal
           rustup target add aarch64-apple-ios --toolchain 1.98.1
 
@@ -131,10 +133,60 @@ jobs:
           set -euo pipefail
           ./make-ios.sh --ipa
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Mush8-ipa
-          path: mush8/build/Mush8.ipa
-          if-no-files-found: error
-          retention-days: 7
+      - name: Upload IPA to Google Drive
+        shell: bash
+        env:
+          MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON }}
+          MUSH8_GDRIVE_FOLDER_ID: 141J4pdCwcl9RoLpsnddfUovV7ttGeVqc
+        run: |
+          set -euo pipefail
+
+          IPA_PATH="mush8/build/Mush8.ipa"
+          if [[ ! -s "$IPA_PATH" ]]; then
+            echo "IPA file missing or empty: $IPA_PATH"
+            exit 1
+          fi
+
+          export MUSH8_IPA_PATH="$IPA_PATH"
+          "$RUNNER_TEMP/mush8-python/bin/python" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          credentials_json = os.environ.get("MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+          if not credentials_json:
+              raise RuntimeError("MUSH8_GDRIVE_SERVICE_ACCOUNT_JSON is empty")
+
+          folder_id = os.environ.get("MUSH8_GDRIVE_FOLDER_ID", "").strip()
+          if not folder_id:
+              raise RuntimeError("MUSH8_GDRIVE_FOLDER_ID is empty")
+
+          ipa_path = Path(os.environ["MUSH8_IPA_PATH"])
+          if not ipa_path.exists() or ipa_path.stat().st_size == 0:
+              raise RuntimeError(f"IPA missing or empty: {ipa_path}")
+
+          credentials = service_account.Credentials.from_service_account_info(
+              json.loads(credentials_json),
+              scopes=["https://www.googleapis.com/auth/drive.file"],
+          )
+
+          service = build("drive", "v3", credentials=credentials)
+          metadata = {"name": ipa_path.name, "parents": [folder_id]}
+          media = MediaFileUpload(str(ipa_path), mimetype="application/octet-stream")
+
+          uploaded = service.files().create(
+              body=metadata,
+              media_body=media,
+              fields="id,webViewLink",
+          ).execute()
+
+          file_id = uploaded.get("id", "")
+          web_view_link = uploaded.get("webViewLink", "")
+          print(f"Uploaded IPA to Google Drive. File ID: {file_id}")
+          if web_view_link:
+              print(f"Web view link: {web_view_link}")
+          PY
