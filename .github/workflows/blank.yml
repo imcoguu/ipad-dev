@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-ipa:
     name: Build Mush8 for iOS
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 120
 
     steps:
@@ -199,6 +199,7 @@ jobs:
               body=metadata,
               media_body=media,
               fields="id,webViewLink",
+              supportsAllDrives=True,
           ).execute()
 
           file_id = uploaded.get("id", "")
