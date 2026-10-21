@@ -132,6 +132,7 @@ jobs:
         working-directory: mush8
         shell: bash
         env:
+          RUSTFLAGS: "-C link-arg=-Wl,-no_compact_unwind"
           BUNDLE_ID: com.imcoguu.mush8
         run: |
           set -euo pipefail
