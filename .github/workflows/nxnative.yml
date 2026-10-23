@@ -65,7 +65,7 @@ jobs:
           xcodegen version
           dotnet --version
           glslangValidator --version
-          spirv-cross --version
+          spirv-cross --help || true
 
       - name: Download private game assets from Google Drive
         shell: bash
