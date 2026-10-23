@@ -22,6 +22,7 @@ jobs:
       - name: Check required secrets
         shell: bash
         env:
+          NXNATIVE_GAME_ID: ${{ secrets.NXNATIVE_GAME_ID }}
           NXNATIVE_PROD_KEYS_URL: ${{ secrets.NXNATIVE_PROD_KEYS_URL }}
           NXNATIVE_BASE_NSP_URL: ${{ secrets.NXNATIVE_BASE_NSP_URL }}
           NXNATIVE_GDRIVE_OAUTH_CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
@@ -32,6 +33,7 @@ jobs:
           set -euo pipefail
 
           for name in \
+            NXNATIVE_GAME_ID \
             NXNATIVE_PROD_KEYS_URL \
             NXNATIVE_BASE_NSP_URL \
             NXNATIVE_GDRIVE_OAUTH_CLIENT_ID \
@@ -125,15 +127,18 @@ jobs:
 
       - name: Build IPA with nxnative
         shell: bash
+        env:
+          DM_GAME: ${{ secrets.NXNATIVE_GAME_ID }}
         run: |
           set -euo pipefail
           mkdir -p output_ipa
           
           cd nxnative
 
-          # Actualiza dmsh_chain.lock con las herramientas del runner de GitHub
+          # Actualiza el lock de la cadena de herramientas de shaders para el juego indicado
           "$RUNNER_TEMP/nxnative-python/bin/python" dm/gfx/tools/dmsh_chain.py --update-lock
 
+          # Compila la IPA
           "$RUNNER_TEMP/nxnative-python/bin/python" scripts/build_ipa_from_nsp.py \
             ../game_input \
             -k ../game_input/prod.keys \
