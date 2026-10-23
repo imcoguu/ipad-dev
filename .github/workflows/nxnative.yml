@@ -130,6 +130,10 @@ jobs:
           mkdir -p output_ipa
           
           cd nxnative
+
+          # Actualiza dmsh_chain.lock con las herramientas del runner de GitHub
+          "$RUNNER_TEMP/nxnative-python/bin/python" dm/gfx/tools/dmsh_chain.py --update-lock
+
           "$RUNNER_TEMP/nxnative-python/bin/python" scripts/build_ipa_from_nsp.py \
             ../game_input \
             -k ../game_input/prod.keys \
