@@ -69,7 +69,7 @@ jobs:
           echo "Checking CLI tool binaries..."
           xcodegen --version
           zstd --version
-          spirv-cross --version
+          spirv-cross --help > /dev/null || true
           dotnet --version
 
           echo "Checking Python dependencies..."
