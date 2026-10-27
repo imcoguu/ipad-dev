@@ -110,19 +110,7 @@ jobs:
 
           service = build("drive", "v3", credentials=credentials)
 
-          print(f"Checking Google Drive folder ID: {folder_id}...")
-          folder = service.files().get(
-              fileId=folder_id,
-              fields="id, name, capabilities/canAddChildren"
-          ).execute()
-
-          print(f"Folder located: '{folder.get('name')}'")
-
-          capabilities = folder.get("capabilities", {})
-          if not capabilities.get("canAddChildren", False):
-              raise PermissionError("The OAuth credentials lack write permissions for this folder.")
-
-          print("Testing file creation & deletion permissions in target folder...")
+          print(f"Testing write access to Google Drive folder ID: {folder_id}...")
           dummy_metadata = {"name": ".nxnative_perm_test.tmp", "parents": [folder_id]}
           dummy_media = MediaIoBaseUpload(io.BytesIO(b"ok"), mimetype="text/plain")
 
