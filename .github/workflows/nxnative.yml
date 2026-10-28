@@ -193,7 +193,7 @@ jobs:
           "$RUNNER_TEMP/nxnative-python/bin/python" scripts/build_ipa_from_nsp.py \
             ../game_input \
             -k ../game_input/prod.keys \
-            -o ../output_ipa/ \
+            -o ../output_ipa/game.ipa \
             --allow-other-metal
 
           ls -lh ../output_ipa/
