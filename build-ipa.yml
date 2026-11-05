@@ -1,0 +1,516 @@
+# Compila el .ipa de Mario Kart World (Switch 2) desde tu dump y lo deja en Google Drive.
+#
+# Pensado para subirse a un repositorio privado propio, en .github/workflows/.
+# El repo se clona a sí mismo (o el que diga BUILD_REPO) y el dump del juego se
+# baja de Drive, porque pesa 22 GB y no cabe en git.
+#
+# La parte de Drive copia la de nxnative.yml: OAuth con refresh token, alcance
+# drive.file, gdown para bajar y googleapiclient para subir. Los nombres de los
+# secretos son los mismos, para poder reutilizar los valores.
+#
+# Secretos:
+#
+#   NXNATIVE_GDRIVE_OAUTH_CLIENT_ID       id de cliente OAuth
+#   NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET   secreto del cliente
+#   NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN   refresh token
+#   NXNATIVE_GDRIVE_ROM_FOLDER            enlace (o id) de la carpeta con el dump
+#   NXNATIVE_GDRIVE_FOLDER_ID             id de la carpeta de destino
+#
+# Opcionales:
+#
+#   BUILD_REPO          otro repo a compilar (por defecto, el que contiene este yml)
+#   BUILD_REPO_TOKEN    token para clonarlo si es privado
+#
+# Aviso sobre el alcance: `drive.file` solo da acceso a lo que ha creado esta
+# app. gdown baja igual si los archivos están compartidos por enlace; si tu dump
+# es privado de verdad, cambia el alcance a /auth/drive y vuelve a generar el
+# refresh token.
+
+name: Compilar IPA de Mario Kart World
+
+on:
+  workflow_dispatch:
+    inputs:
+      romfs:
+        description: 'romfs: separate = .ipa pequeño + RomFS.img aparte; bundle = todo dentro del .ipa'
+        type: choice
+        options: [separate, bundle]
+        default: separate
+      app_name:
+        description: 'Nombre en la pantalla de inicio (vacío = el del juego)'
+        required: false
+      keep_romfs:
+        description: 'Subir también el RomFS.img (22 GB) a Drive'
+        type: boolean
+        default: true
+
+# Un build a la vez: dos a la vez se pelean por la cuota de Drive y por la caché.
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Necesita macOS con Apple silicon. macos-26 trae un Xcode más nuevo que los
+    # runners anteriores; el paso 2 comprueba que sea el 27.2 que pide el proyecto.
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Comprobar el entorno (Xcode, disco, herramientas)
+        run: |
+          set -euo pipefail
+          echo "=== macOS ==="
+          sw_vers
+          echo "=== Xcode instalados ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "ninguno en /Applications"
+          echo "=== espacio en disco ==="
+          df -h /
+
+          libre_gb=$(df -k / | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Libre: ${libre_gb} GB"
+          if [ "${libre_gb}" -lt 60 ]; then
+              echo "::error::Este runner tiene ${libre_gb} GB libres y el build necesita unos 60 (22 del dump + 27 del build + margen). Usa un runner mayor (macos-26-xlarge o self-hosted) o sube el disco del runner."
+              exit 1
+          fi
+
+      - name: Seleccionar el Xcode más nuevo disponible
+        id: xcode
+        run: |
+          set -euo pipefail
+          # El proyecto pide Xcode 27.2 y su compilador de Metal.
+          app=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -t. -k1,1n -k2,2n | tail -1 || true)
+          if [ -z "${app}" ]; then
+              echo "::error::No hay ningún Xcode instalado en el runner."
+              exit 1
+          fi
+          sudo xcode-select -s "${app}"
+          xcodebuild -version
+          version=$(xcodebuild -version | awk '/Xcode/ {print $2}')
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "app=${app}" >> "${GITHUB_OUTPUT}"
+
+          menor=$(printf '%s\n%s\n' "27.2" "${version}" | sort -t. -k1,1n -k2,2n | head -1)
+          if [ "${menor}" != "27.2" ]; then
+              echo "::error::Xcode ${version} es más viejo que el 27.2 que pide el proyecto: los shaders no compilan con el Metal de una versión anterior. Cambia el runner o instala el 27.2 a mano en un runner propio."
+              exit 1
+          fi
+
+      - name: Traer el compilador de Metal
+        run: |
+          # Componente aparte desde Xcode 26; sin él falla el paso de shaders.
+          xcodebuild -downloadComponent MetalToolchain || echo "::warning::MetalToolchain no se pudo descargar; si el build falla en los shaders, es esto."
+
+      - name: Clonar el repositorio a compilar
+        env:
+          REPO: ${{ secrets.BUILD_REPO }}
+          TOKEN: ${{ secrets.BUILD_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Si BUILD_REPO está vacío, se compila el repo donde vive este workflow.
+          url="${REPO:-${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}}"
+          url="${url%.git}"
+          if [ -n "${TOKEN:-}" ]; then
+              # x-access-token evita que el token acabe en la URL pública del log.
+              git clone --depth 1 "https://x-access-token:${TOKEN}@${url#https://}" src
+          else
+              git clone --depth 1 "${url}.git" src
+          fi
+          cd src && git log --oneline -1
+
+      - name: Comprobar que están los secretos de Drive
+        env:
+          CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET }}
+          REFRESH: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN }}
+          ROM_FOLDER: ${{ secrets.NXNATIVE_GDRIVE_ROM_FOLDER }}
+          OUT_FOLDER: ${{ secrets.NXNATIVE_GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          for nombre in CLIENT_ID CLIENT_SECRET REFRESH ROM_FOLDER OUT_FOLDER; do
+              if [ -z "${!nombre:-}" ]; then
+                  echo "::error::Falta el secreto ${nombre}"
+                  exit 1
+              fi
+          done
+          echo "Secretos presentes"
+
+      - name: Preparar Python y herramientas del build
+        run: |
+          set -euo pipefail
+          cd src
+          brew install xcodegen zstd glslang
+          brew install --cask dotnet-sdk || echo "::warning::dotnet-sdk ya presente o el cask falló"
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic \
+              "backports.zstd; python_version < '3.14'" gdown google-api-python-client
+          python3 --version
+          python3 -c "import lz4, capstone, fontTools, gdown, googleapiclient; print('deps ok')"
+
+      - name: Comprobar el acceso de escritura a Drive
+        env:
+          CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET }}
+          REFRESH: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN }}
+          FOLDER_ID: ${{ secrets.NXNATIVE_GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          cd src
+          . .venv/bin/activate
+          python3 - <<'PY'
+          import io
+          import os
+
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseUpload
+
+          credenciales = Credentials(
+              None,
+              refresh_token=os.environ["REFRESH"].strip(),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["CLIENT_ID"].strip(),
+              client_secret=os.environ["CLIENT_SECRET"].strip(),
+              scopes=["https://www.googleapis.com/auth/drive.file"],
+          )
+          servicio = build("drive", "v3", credentials=credenciales)
+          carpeta = os.environ["FOLDER_ID"].strip()
+
+          prueba = servicio.files().create(
+              body={"name": ".mkw_permiso.tmp", "parents": [carpeta]},
+              media_body=MediaIoBaseUpload(io.BytesIO(b"ok"), mimetype="text/plain"),
+              fields="id",
+          ).execute()
+          servicio.files().delete(fileId=prueba["id"]).execute()
+          print("Drive: escritura verificada")
+          PY
+
+      - name: Bajar el zip desde Drive
+        env:
+          ROM_FOLDER: ${{ secrets.NXNATIVE_GDRIVE_ROM_FOLDER }}
+        run: |
+          set -euo pipefail
+          cd src
+          . .venv/bin/activate
+          cd "$GITHUB_WORKSPACE"
+          rm -rf descarga game_input
+          mkdir -p descarga
+
+          # Acepta el enlace de carpeta, el de archivo o el id a pelo.
+          entrada="$(printf '%s' "${ROM_FOLDER}" | tr -d '[:space:]')"
+          es_carpeta=false
+          if [[ "${entrada}" =~ /folders/([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"; es_carpeta=true
+          elif [[ "${entrada}" =~ /d/([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+          elif [[ "${entrada}" =~ [?\&]id=([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"
+          else
+              id="${entrada}"; es_carpeta=true
+          fi
+
+          if [ "${es_carpeta}" = true ]; then
+              echo "Bajando la carpeta ${id}…"
+              # --remaining-ok: sin esto gdown corta a los 50 archivos.
+              python3 -m gdown --folder "https://drive.google.com/drive/folders/${id}" \
+                  -O descarga/ --remaining-ok
+          else
+              echo "Bajando el archivo ${id}…"
+              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O descarga/
+          fi
+
+          echo "=== descargado ==="
+          du -sh descarga
+          find descarga -maxdepth 2 | head -20
+          df -h /
+
+      - name: Extraer el zip y borrarlo
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p game_input
+
+          # Extrae todos los .zip que haya y los borra en cuanto salen, para no
+          # tener a la vez el zip y su contenido (22 GB cada uno).
+          encontrado=false
+          while IFS= read -r zip; do
+              encontrado=true
+              echo "Extrayendo ${zip}…"
+              unzip -q -o "${zip}" -d descarga/extraido
+              rm -f "${zip}"
+              echo "  borrado ${zip}"
+          done < <(find descarga -maxdepth 3 -iname '*.zip')
+
+          if [ "${encontrado}" = false ]; then
+              echo "::warning::No hay ningún .zip en la descarga; se usa lo que haya."
+              mkdir -p descarga/extraido
+              cp -a descarga/. descarga/extraido/ 2>/dev/null || true
+          fi
+
+          # Búsqueda recursiva de la carpeta "base" del dump. Se comprueba que
+          # tenga exefs/main.npdm dentro para no confundirla con otra "base".
+          base=""
+          while IFS= read -r candidata; do
+              if [ -f "${candidata}/exefs/main.npdm" ]; then
+                  base="${candidata}"
+                  break
+              fi
+          done < <(find descarga/extraido -type d -name base -print)
+
+          if [ -z "${base}" ]; then
+              echo "::error::No encuentro ninguna carpeta 'base' con exefs/main.npdm dentro. Esto hay dentro de la extracción:"
+              find descarga/extraido -maxdepth 4 | head -60
+              exit 1
+          fi
+
+          origen=$(dirname "${base}")
+          echo "Dump encontrado en: ${origen}"
+
+          # base/ (y updates/ o dlc/ si los hubiera) pasa a game_input/, que es
+          # lo que el script espera: base/ como hijo directo.
+          shopt -s dotglob nullglob
+          mv "${origen}"/* game_input/ 2>/dev/null || true
+          shopt -u dotglob nullglob
+
+          # Lo que quede de la descarga: zip ya borrados, extracción ya movida.
+          rm -rf descarga
+
+          if [ ! -f game_input/base/exefs/main.npdm ]; then
+              echo "::error::Tras mover, game_input/base/exefs/main.npdm no existe. Contenido:"
+              find game_input -maxdepth 3 | head -40
+              exit 1
+          fi
+
+          echo "=== dump listo ==="
+          du -sh game_input game_input/base/* 2>/dev/null
+          find game_input -maxdepth 2 | head -30
+          df -h /
+
+      - name: Compilar el .ipa
+        env:
+          ROMFS: ${{ inputs.romfs }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          cd src
+          . .venv/bin/activate
+
+          argumentos=(--platform ios --romfs "${ROMFS}")
+          [ -n "${APP_NAME:-}" ] && argumentos+=(--app-name "${APP_NAME}")
+
+          # El dump va como carpeta; prod.keys no hace falta para un dump.
+          python3 scripts/build_ipa_from_nsp.py "$GITHUB_WORKSPACE/game_input" "${argumentos[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          echo "=== resultados ==="
+          find "$GITHUB_WORKSPACE/games" "$GITHUB_WORKSPACE/game_input" -name '*.ipa' -o -name 'RomFS.img' 2>/dev/null | sort
+
+      - name: Borrar el dump crudo extraído
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          # base/ ya ha cumplido: el RomFS.img preparado está en el build folder
+          # (<id>_build/extract/v<N>/RomFS.img). Se borra el dump entero para
+          # liberar los 22 GB antes de mover la salida.
+          antes=$(df -k . | awk 'NR==2 {print int($4 / 1048576)}')
+          rm -rf game_input/base
+          despues=$(df -k . | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Dump crudo borrado: ${antes} GB libres → ${despues} GB"
+          echo "=== lo que queda ==="
+          du -sh game_input/* 2>/dev/null | head
+          find game_input -maxdepth 4 -name 'RomFS.img' -o -maxdepth 4 -name '*.ipa' | head
+
+      - name: Reunir lo generado
+        run: |
+          set -euo pipefail
+          mkdir -p salida
+          ipa=$(find game_input . -maxdepth 6 -name '*.ipa' 2>/dev/null | sort | tail -1)
+          if [ -z "${ipa}" ]; then
+              echo "::error::El build terminó sin .ipa. Mira las últimas líneas de build.log."
+              tail -40 build.log
+              exit 1
+          fi
+          cp -f "${ipa}" salida/
+          echo "IPA: $(du -h salida/*.ipa | tail -1)"
+
+          if [ "${{ inputs.keep_romfs }}" = "true" ]; then
+              # El RomFS.img preparado, no la rom cruda (esa ya no existe).
+              romfs=$(find game_input -name 'RomFS.img' -size +1G 2>/dev/null | sort | tail -1 || true)
+              if [ -n "${romfs}" ]; then
+                  echo "RomFS: $(du -h "${romfs}" | cut -f1)"
+                  versiona=$(basename "$(dirname "${romfs}")")
+                  mkdir -p "salida/romfs/${versiona}"
+                  cp -f "${romfs}" "salida/romfs/${versiona}/RomFS.img"
+              else
+                  echo "::warning::No hay RomFS.img (con --romfs bundle va dentro del .ipa)."
+              fi
+          fi
+
+          echo "=== salida ==="
+          du -sh salida/* 2>/dev/null | head
+
+      - name: Subir el resultado a Drive
+        env:
+          CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET }}
+          REFRESH: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN }}
+          FOLDER_ID: ${{ secrets.NXNATIVE_GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          cd src
+          . .venv/bin/activate
+
+          ipa=$(find "$GITHUB_WORKSPACE/salida" -maxdepth 1 -name '*.ipa' | head -1)
+          if [ -z "${ipa}" ] || [ ! -s "${ipa}" ]; then
+              echo "::error::No hay .ipa en salida/"
+              exit 1
+          fi
+          romfs=$(find "$GITHUB_WORKSPACE/salida/romfs" -name 'RomFS.img' 2>/dev/null | head -1 || true)
+
+          export MKW_IPA="${ipa}"
+          export MKW_ROMFS="${romfs}"
+
+          python3 - <<'PY'
+          import os
+          import time
+          from pathlib import Path
+
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          credenciales = Credentials(
+              None,
+              refresh_token=os.environ["REFRESH"].strip(),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["CLIENT_ID"].strip(),
+              client_secret=os.environ["CLIENT_SECRET"].strip(),
+              scopes=["https://www.googleapis.com/auth/drive.file"],
+          )
+          servicio = build("drive", "v3", credentials=credenciales)
+          carpeta = os.environ["FOLDER_ID"].strip()
+          fecha = time.strftime("%Y-%m-%d_%H%M", time.gmtime())
+          run = os.environ.get("GITHUB_RUN_NUMBER", "0")
+
+          # El RomFS son 22 GB: subida por trozos, con reintentos y progreso.
+          def subir(ruta: Path, destino: str) -> str:
+              tam = ruta.stat().st_size
+              media = MediaFileUpload(
+                  str(ruta),
+                  mimetype="application/octet-stream",
+                  resumable=True,
+                  chunksize=64 * 1024 * 1024,
+              )
+              peticion = servicio.files().create(
+                  body={"name": ruta.name, "parents": [destino]},
+                  media_body=media,
+                  fields="id,webViewLink",
+              )
+              respuesta = None
+              intentos = 0
+              ultimo = 0
+              while respuesta is None:
+                  try:
+                      estado, respuesta = peticion.next_chunk()
+                  except Exception as error:
+                      intentos += 1
+                      if intentos > 6:
+                          raise
+                      print(f"  reintento {intentos} tras {error!r}")
+                      time.sleep(2 ** intentos)
+                      continue
+                  if estado:
+                      enviado = estado.resumable_progress
+                      if enviado - ultimo >= 512 * 1024 * 1024 or enviado >= tam:
+                          print(f"  {enviado / tam * 100:5.1f} %  ({enviado / 2**30:.1f} GiB de {tam / 2**30:.1f})")
+                          ultimo = enviado
+              return respuesta.get("id", "")
+
+          def carpeta_destino(nombre: str) -> str:
+              existe = servicio.files().list(
+                  q=f"name = '{nombre}' and '{carpeta}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                  fields="files(id)",
+                  supportsAllDrives=True,
+              ).execute()
+              if existe.get("files"):
+                  return existe["files"][0]["id"]
+              creada = servicio.files().create(
+                  body={
+                      "name": nombre,
+                      "mimeType": "application/vnd.google-apps.folder",
+                      "parents": [carpeta],
+                  },
+                  fields="id",
+              ).execute()
+              return creada["id"]
+
+          destino = carpeta_destino(f"mkw-ipa-{fecha}-{run}")
+          print(f"Subiendo a la carpeta de Drive {destino}")
+
+          ipa = Path(os.environ["MKW_IPA"])
+          print(f"IPA: {ipa.name} ({ipa.stat().st_size / 2**20:.0f} MiB)")
+          print(f"  id: {subir(ipa, destino)}")
+
+          romfs = os.environ.get("MKW_ROMFS", "").strip()
+          if romfs and Path(romfs).exists():
+              ruta = Path(romfs)
+              print(f"RomFS: {ruta.name} ({ruta.stat().st_size / 2**30:.1f} GiB)")
+              print(f"  id: {subir(ruta, destino)}")
+          PY
+
+      - name: Guardar el .ipa también como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ github.run_number }}
+          path: salida/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Guardar el registro del build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+# ---------------------------------------------------------------------------
+# Notas para quien mantenga esto
+#
+# 1. Xcode. El proyecto pide Xcode 27.2 y macOS 26.6 (README y TUTORIAL). El paso
+#    "Seleccionar el Xcode más nuevo" falla a propósito si el que encuentra es
+#    más viejo, porque compilar los 11.561 shaders con un Metal anterior deja el
+#    paso a medias. Salidas: runner propio con el 27.2, o --allow-other-metal
+#    (como en nxnative.yml), sabiendo que el propio proyecto avisa de corrupción
+#    con otro compilador (issue #242).
+#
+# 2. Disco. El dump son 22 GB y el build otros 27 GB. El primer paso aborta si
+#    hay menos de 60 GB libres. Si el runner no llega, antes de cambiar de
+#    máquina se puede liberar espacio como en nxnative.yml (Android SDK, cachés,
+#    CoreSimulator, dotnet).
+#
+# 3. Tiempo. Primer build: 30-60 min de compilación más 20-30 min de shaders.
+#    El job tiene 350 min de margen y la caché de shaders no se guarda entre
+#    ejecuciones: cada run paga ese tiempo otra vez.
+#
+# 4. RomFS.img. Con --romfs separate el .ipa pesa ~690 MB y los archivos del
+#    juego van en un RomFS.img de ~21,7 GB. Por eso se sube a Drive y no como
+#    artefacto (GitHub corta en 10 GB). El .ipa sí va como artefacto, por si
+#    Drive falla.
+#
+# 5. Subida. La de nxnative.yml hace create().execute() de una vez, que sirve
+#    para 690 MB pero no aguanta un corte de red a los 15 GB. Aquí va por trozos
+#    de 64 MiB con reintentos y progreso.
+#
+# 6. Nada del juego viaja en git: el dump entra y sale por Drive, y el workspace
+#    del runner se destruye al terminar.
