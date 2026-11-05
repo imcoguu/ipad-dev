@@ -77,27 +77,33 @@ jobs:
               exit 1
           fi
 
-      - name: Seleccionar Xcode 27.2
+      - name: Seleccionar Xcode
         run: |
           set -euo pipefail
-          # Ruta fija: este proyecto se compila con el Metal de Xcode 27.2, y con
-          # otro el paso de shaders sale mal. Sin búsquedas ni comparaciones.
-          app="/Applications/Xcode-27.2.app"
-          if [ ! -d "${app}" ]; then
-              echo "::error::No existe ${app} en este runner. Instálalo ahí o cambia la ruta de este paso."
-              echo "Xcode instalados:"
+          # Los runners de GitHub no traen el 27.2. Si está, se usa; si no, el que
+          # haya, y los shaders se compilan con --allow-other-metal (más abajo),
+          # que es la vía que usa nxnative.yml en macos-15.
+          if [ -d /Applications/Xcode-27.2.app ]; then
+              app=/Applications/Xcode-27.2.app
+          elif [ -d /Applications/Xcode_27.2.app ]; then
+              app=/Applications/Xcode_27.2.app
+          elif [ -d /Applications/Xcode.app ]; then
+              app=/Applications/Xcode.app
+              echo "::warning::Sin Xcode 27.2 en el runner: se compila con el Metal del que hay."
+          else
+              app=$(ls -d /Applications/Xcode*.app 2>/dev/null | head -1 || true)
+              echo "::warning::Sin Xcode.app; se usa ${app}"
+          fi
+
+          if [ -z "${app:-}" ] || [ ! -d "${app}" ]; then
+              echo "::error::No hay ningún Xcode en el runner."
               ls -d /Applications/Xcode*.app 2>/dev/null || echo "  ninguno"
               exit 1
           fi
 
+          echo "Usando: ${app}"
           sudo xcode-select -s "${app}"
           xcodebuild -version
-
-          version=$(xcodebuild -version | awk '/^Xcode/ {print $2}')
-          if [ "${version}" != "27.2" ]; then
-              echo "::error::xcodebuild dice ${version}, no 27.2. Comprueba ${app}."
-              exit 1
-          fi
 
       - name: Traer el compilador de Metal
         run: |
@@ -290,7 +296,13 @@ jobs:
           cd src
           . .venv/bin/activate
 
-          argumentos=(--platform ios --romfs "${ROMFS}")
+          argumentos=(
+              --platform ios
+              --romfs "${ROMFS}"
+              # Compila los shaders con el Metal que tenga el runner. Sin esto,
+              # Xcode distinto de 27.2 aborta el paso de shaders.
+              --allow-other-metal
+          )
           [ -n "${APP_NAME:-}" ] && argumentos+=(--app-name "${APP_NAME}")
 
           # El dump va como carpeta; prod.keys no hace falta para un dump.
