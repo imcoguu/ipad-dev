@@ -186,6 +186,75 @@ jobs:
           print("Drive: escritura verificada")
           PY
 
+      - name: Restaurar la caché de shaders
+        env:
+          CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET }}
+          REFRESH: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN }}
+          FOLDER_ID: ${{ secrets.NXNATIVE_GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd src
+          . .venv/bin/activate
+
+          ARCHIVO=/tmp/mkw-shaders.tar.zst
+          rm -f "${ARCHIVO}"
+
+          python3 - <<'PY'
+          import os
+          import time
+
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          credenciales = Credentials(
+              None,
+              refresh_token=os.environ["REFRESH"].strip(),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["CLIENT_ID"].strip(),
+              client_secret=os.environ["CLIENT_SECRET"].strip(),
+              scopes=["https://www.googleapis.com/auth/drive.file"],
+          )
+          servicio = build("drive", "v3", credentials=credenciales)
+          carpeta = os.environ["FOLDER_ID"].strip()
+
+          encontrados = servicio.files().list(
+              q=f"name = 'mkw-shaders.tar.zst' and '{carpeta}' in parents and trashed = false",
+              fields="files(id, size)",
+              orderBy="modifiedTime desc",
+          ).execute().get("files", [])
+
+          if not encontrados:
+              print("no hay caché de shaders guardada; el build los compilará")
+              raise SystemExit(0)
+
+          fichero = encontrados[0]
+          peso = int(fichero.get("size", 0))
+          print(f"bajando la caché ({peso / 2**30:.2f} GiB)")
+
+          peticion = servicio.files().get_media(fileId=fichero["id"])
+          with open("/tmp/mkw-shaders.tar.zst", "wb") as salida:
+              descarga = MediaIoBaseDownload(salida, peticion, chunksize=64 * 1024 * 1024)
+              termina = False
+              ultimo = 0
+              while not termina:
+                  estado, termina = descarga.next_chunk()
+                  if estado and estado.resumable_progress - ultimo >= 512 * 1024 * 1024:
+                      print(f"  {estado.resumable_progress / 2**30:.1f} GiB")
+                      ultimo = estado.resumable_progress
+          print("caché descargada")
+          PY
+
+          if [ -s "${ARCHIVO}" ]; then
+              zstd -dc "${ARCHIVO}" | tar -xf - -C "$GITHUB_WORKSPACE/work"
+              rm -f "${ARCHIVO}"
+              echo "=== caché restaurada ==="
+              du -sh "$GITHUB_WORKSPACE"/work/* 2>/dev/null | head -10
+              find "$GITHUB_WORKSPACE/work" -maxdepth 4 -name 'b-*.key' -o -maxdepth 4 -name '*.metallib' | head -5
+          fi
+
       - name: Bajar el zip desde Drive
         env:
           ROM_FOLDER: ${{ secrets.NXNATIVE_GDRIVE_ROM_FOLDER }}
@@ -299,6 +368,9 @@ jobs:
           argumentos=(
               --platform ios
               --romfs "${ROMFS}"
+              # Carpeta fija: ahí vive shader/, profile/ y extract/, que es lo que
+              # se guarda entre ejecuciones en Drive.
+              --work-dir "$GITHUB_WORKSPACE/work"
               # Compila los shaders con el Metal que tenga el runner. Sin esto,
               # Xcode distinto de 27.2 aborta el paso de shaders.
               --allow-other-metal
@@ -310,6 +382,102 @@ jobs:
 
           echo "=== resultados ==="
           find "$GITHUB_WORKSPACE/games" "$GITHUB_WORKSPACE/game_input" -name '*.ipa' -o -name 'RomFS.img' 2>/dev/null | sort
+
+      - name: Guardar la caché de shaders
+        if: always()
+        env:
+          CLIENT_ID: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_CLIENT_SECRET }}
+          REFRESH: ${{ secrets.NXNATIVE_GDRIVE_OAUTH_REFRESH_TOKEN }}
+          FOLDER_ID: ${{ secrets.NXNATIVE_GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          # El .key lo escribe el build solo cuando los shaders han salido bien.
+          # Sin él, la caché a medias no sirve y no se sube.
+          clave=$(find work/shader/ios -maxdepth 1 -name 'b-*.key' 2>/dev/null | head -1 || true)
+          if [ -z "${clave}" ]; then
+              echo "::warning::Sin .key de shaders (build fallido o incompleto); no guardo caché."
+              exit 0
+          fi
+          echo "clave: ${clave}"
+
+          ARCHIVO=/tmp/mkw-shaders.tar.zst
+          rm -f "${ARCHIVO}"
+
+          # Se guarda lo justo para que la próxima vez se reutilice: las librerías
+          # iOS con su .key, la tabla que es entrada de los shaders y el profile.
+          # shader/cache/ se queda fuera: es la parte gorda y no hace falta.
+          partes=(shader/ios)
+          [ -f work/shader/pso_pairs.tsv ] && partes+=(shader/pso_pairs.tsv)
+          [ -d work/profile ] && partes+=(profile)
+
+          echo "empaquetando: ${partes[*]}"
+          tar -cf - -C work "${partes[@]}" | zstd -19 -T0 -o "${ARCHIVO}"
+          echo "paquete: $(du -h "${ARCHIVO}" | cut -f1)"
+
+          cd src
+          . .venv/bin/activate
+          export MKW_CACHE="${ARCHIVO}"
+
+          python3 - <<'PY'
+          import os
+          import time
+          from pathlib import Path
+
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          credenciales = Credentials(
+              None,
+              refresh_token=os.environ["REFRESH"].strip(),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["CLIENT_ID"].strip(),
+              client_secret=os.environ["CLIENT_SECRET"].strip(),
+              scopes=["https://www.googleapis.com/auth/drive.file"],
+          )
+          servicio = build("drive", "v3", credentials=credenciales)
+          carpeta = os.environ["FOLDER_ID"].strip()
+          ruta = Path(os.environ["MKW_CACHE"])
+
+          # Una sola copia: se borra la anterior antes de subir la nueva.
+          for viejo in servicio.files().list(
+              q=f"name = 'mkw-shaders.tar.zst' and '{carpeta}' in parents and trashed = false",
+              fields="files(id)",
+          ).execute().get("files", []):
+              servicio.files().delete(fileId=viejo["id"]).execute()
+              print(f"borrada la caché anterior ({viejo['id']})")
+
+          media = MediaFileUpload(
+              str(ruta), mimetype="application/octet-stream", resumable=True,
+              chunksize=64 * 1024 * 1024)
+          peticion = servicio.files().create(
+              body={"name": "mkw-shaders.tar.zst", "parents": [carpeta]},
+              media_body=media, fields="id,webViewLink")
+
+          respuesta = None
+          intentos = 0
+          ultimo = 0
+          tam = ruta.stat().st_size
+          while respuesta is None:
+              try:
+                  estado, respuesta = peticion.next_chunk()
+              except Exception as error:
+                  intentos += 1
+                  if intentos > 6:
+                      raise
+                  print(f"  reintento {intentos} tras {error!r}")
+                  time.sleep(2 ** intentos)
+                  continue
+              if estado and estado.resumable_progress - ultimo >= 256 * 1024 * 1024:
+                  print(f"  subido {estado.resumable_progress / 2**30:.1f} GiB de {tam / 2**30:.1f}")
+                  ultimo = estado.resumable_progress
+          print("caché subida:", respuesta.get("id", ""))
+          PY
+
+          rm -f "${ARCHIVO}"
 
       - name: Borrar el dump crudo extraído
         run: |
@@ -331,7 +499,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p salida
-          ipa=$(find game_input . -maxdepth 6 -name '*.ipa' 2>/dev/null | sort | tail -1)
+          ipa=$(find . -maxdepth 6 -name '*.ipa' 2>/dev/null | sort | tail -1)
           if [ -z "${ipa}" ]; then
               echo "::error::El build terminó sin .ipa. Mira las últimas líneas de build.log."
               tail -40 build.log
@@ -342,7 +510,7 @@ jobs:
 
           if [ "${{ inputs.keep_romfs }}" = "true" ]; then
               # El RomFS.img preparado, no la rom cruda (esa ya no existe).
-              romfs=$(find game_input -name 'RomFS.img' -size +1G 2>/dev/null | sort | tail -1 || true)
+              romfs=$(find work game_input -name 'RomFS.img' -size +1G 2>/dev/null | sort | tail -1 || true)
               if [ -n "${romfs}" ]; then
                   echo "RomFS: $(du -h "${romfs}" | cut -f1)"
                   versiona=$(basename "$(dirname "${romfs}")")
