@@ -77,25 +77,25 @@ jobs:
               exit 1
           fi
 
-      - name: Seleccionar el Xcode más nuevo disponible
-        id: xcode
+      - name: Seleccionar Xcode 27.2
         run: |
           set -euo pipefail
-          # El proyecto pide Xcode 27.2 y su compilador de Metal.
-          app=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -t. -k1,1n -k2,2n | tail -1 || true)
-          if [ -z "${app}" ]; then
-              echo "::error::No hay ningún Xcode instalado en el runner."
+          # Ruta fija: este proyecto se compila con el Metal de Xcode 27.2, y con
+          # otro el paso de shaders sale mal. Sin búsquedas ni comparaciones.
+          app="/Applications/Xcode-27.2.app"
+          if [ ! -d "${app}" ]; then
+              echo "::error::No existe ${app} en este runner. Instálalo ahí o cambia la ruta de este paso."
+              echo "Xcode instalados:"
+              ls -d /Applications/Xcode*.app 2>/dev/null || echo "  ninguno"
               exit 1
           fi
+
           sudo xcode-select -s "${app}"
           xcodebuild -version
-          version=$(xcodebuild -version | awk '/Xcode/ {print $2}')
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "app=${app}" >> "${GITHUB_OUTPUT}"
 
-          menor=$(printf '%s\n%s\n' "27.2" "${version}" | sort -t. -k1,1n -k2,2n | head -1)
-          if [ "${menor}" != "27.2" ]; then
-              echo "::error::Xcode ${version} es más viejo que el 27.2 que pide el proyecto: los shaders no compilan con el Metal de una versión anterior. Cambia el runner o instala el 27.2 a mano en un runner propio."
+          version=$(xcodebuild -version | awk '/^Xcode/ {print $2}')
+          if [ "${version}" != "27.2" ]; then
+              echo "::error::xcodebuild dice ${version}, no 27.2. Comprueba ${app}."
               exit 1
           fi
 
