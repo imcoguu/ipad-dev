@@ -1,0 +1,119 @@
+name: Compilar IPA de kid-with-sword-remake
+
+on:
+  workflow_dispatch:
+    inputs:
+      romfs:
+        description: "Empaquetado de los archivos del juego"
+        type: choice
+        options: [bundle, separate]
+        default: bundle
+      app_name:
+        description: "Nombre de la app (opcional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build unsigned iOS IPA
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout del repositorio del workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Seleccionar Xcode disponible
+        run: |
+          set -euo pipefail
+          xcode_app=$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort | tail -1)
+          test -n "$xcode_app" || { echo "::error::No hay Xcode instalado"; exit 1; }
+          sudo xcode-select -s "$xcode_app"
+          xcodebuild -version
+
+      - name: Instalar Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Clonar kid-with-sword-remake
+        run: git clone --depth 1 https://github.com/cheemu21/kid-with-sword-remake.git src
+
+      - name: Instalar herramientas del proyecto
+        working-directory: src
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang
+          if ! command -v dotnet >/dev/null 2>&1; then
+            brew install --cask dotnet-sdk
+          fi
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic \
+            "backports.zstd; python_version < '3.14'"
+
+      # Añade aquí el paso que descargue y prepare el dump. Debe dejar:
+      # game_input/base/exefs/main.npdm
+      - name: Comprobar archivos del juego
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/game_input/base/exefs/main.npdm" ]; then
+            echo "::error::Falta game_input/base/exefs/main.npdm. Añade tu paso de descarga antes de este paso."
+            exit 1
+          fi
+
+      - name: Compilar IPA
+        working-directory: src
+        env:
+          ROMFS: ${{ inputs.romfs }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          args=(--platform ios --romfs "$ROMFS")
+          if [ -n "${APP_NAME:-}" ]; then
+            args+=(--app-name "$APP_NAME")
+          fi
+          python scripts/build_ipa_from_nsp.py "$GITHUB_WORKSPACE/game_input" "${args[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Reunir IPA
+        run: |
+          set -euo pipefail
+          mkdir -p salida
+          ipa=$(find "$GITHUB_WORKSPACE/game_input" -type f -name '*.ipa' | sort | tail -1)
+          if [ -z "$ipa" ]; then
+            echo "::error::La compilación terminó sin generar un IPA"
+            tail -80 build.log || true
+            exit 1
+          fi
+          cp "$ipa" salida/
+          ls -lh salida/
+
+      - name: Subir IPA como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: kid-with-sword-remake-ipa-${{ github.run_number }}
+          path: salida/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Subir log de compilación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kid-with-sword-remake-build-log-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
