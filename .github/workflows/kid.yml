@@ -12,6 +12,10 @@ on:
         description: "Nombre de la app (opcional)"
         required: false
         type: string
+      xcode_app:
+        description: "Ruta del Xcode a usar (vacío = el más nuevo instalado)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,13 +40,67 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Seleccionar Xcode disponible
+      - name: Elegir el Xcode que sepa compilar el proyecto
+        env:
+          XCODE_PEDIDO: ${{ inputs.xcode_app }}
         run: |
           set -euo pipefail
-          xcode_app=$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort | tail -1)
-          test -n "$xcode_app" || { echo "::error::No hay Xcode instalado"; exit 1; }
-          sudo xcode-select -s "$xcode_app"
+
+          # El proyecto usa la API Metal 4 de MetalFX. Con un SDK que no declara
+          # esas propiedades, xcodebuild falla con «property colorContentOffsetX
+          # not found on object of type MTL4FXTemporalScaler», un error que aparece
+          # 74 segundos después y no dice qué hacer.
+          #
+          # Aquí se comprueba en el SDK de cada Xcode, en segundos, y se elige el
+          # primero que la soporte. Xcode-27-2.app va primero; si no está, se
+          # prueban los demás de más nuevo a más viejo.
+          PROPIEDAD="colorContentOffsetX"
+
+          candidatos=()
+          if [ -n "${XCODE_PEDIDO:-}" ]; then
+              candidatos+=("${XCODE_PEDIDO}")
+          fi
+          for preferido in /Applications/Xcode-27-2.app /Applications/Xcode_27.2.app; do
+              [ -d "$preferido" ] && candidatos+=("$preferido")
+          done
+          while IFS= read -r app; do
+              [ -d "$app" ] && candidatos+=("$app")
+          done < <(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -Vr)
+
+          if [ ${#candidatos[@]} -eq 0 ]; then
+              echo "::error::No hay ningún Xcode instalado en el runner"
+              exit 1
+          fi
+
+          elegido=""
+          probados=""
+          for app in "${candidatos[@]}"; do
+              sudo xcode-select -s "$app" 2>/dev/null || continue
+              version=$(xcodebuild -version 2>/dev/null | awk '/^Xcode/ {print $2}')
+              sdk=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)
+              probados="${probados}\n  ${app} (Xcode ${version:-?})"
+
+              if [ -n "$sdk" ] && grep -rqs "$PROPIEDAD" \
+                  "$sdk/System/Library/Frameworks/MetalFX.framework/Headers" \
+                  "$sdk/System/Library/Frameworks/Metal.framework/Headers" 2>/dev/null; then
+                  elegido="$app"
+                  echo "Elegido: ${app} (Xcode ${version}) — su SDK declara ${PROPIEDAD}"
+                  break
+              fi
+              echo "descartado: ${app} (Xcode ${version:-?}) — su SDK no declara ${PROPIEDAD}"
+          done
+
+          if [ -z "$elegido" ]; then
+              echo -e "::error::Ningún Xcode del runner sabe compilar Metal 4 de MetalFX. Probados:${probados}"
+              exit 1
+          fi
+
+          sudo xcode-select -s "$elegido"
           xcodebuild -version
+          echo "--- Metal ---"
+          xcrun metal --version || true
+          echo "--- SDK de iPhone ---"
+          xcrun --sdk iphoneos --show-sdk-version || true
 
       - name: Instalar Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain
@@ -62,15 +120,75 @@ jobs:
           . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic \
-            "backports.zstd; python_version < '3.14'"
+            "backports.zstd; python_version < '3.14'" gdown google-api-python-client
 
-      # Añade aquí el paso que descargue y prepare el dump. Debe dejar:
-      # game_input/base/exefs/main.npdm
+      - name: Bajar el .nup desde Drive
+        env:
+          NUP_URL: ${{ secrets.KID_GDRIVE_NUP_URL }}
+        run: |
+          set -euo pipefail
+          cd src
+          . .venv/bin/activate
+          cd "$GITHUB_WORKSPACE"
+          rm -rf descarga game_input
+          mkdir -p descarga game_input
+
+          if [ -z "${NUP_URL:-}" ]; then
+              echo "::error::Falta el secreto KID_GDRIVE_NUP_URL con el enlace del .nup"
+              exit 1
+          fi
+
+          # Acepta el enlace de archivo de Drive o el id a pelo.
+          entrada="$(printf '%s' "${NUP_URL}" | tr -d '[:space:]')"
+          if [[ "${entrada}" =~ /folders/([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"; es_carpeta=true
+          elif [[ "${entrada}" =~ /d/([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"; es_carpeta=false
+          elif [[ "${entrada}" =~ [?\&]id=([A-Za-z0-9_-]+) ]]; then
+              id="${BASH_REMATCH[1]}"; es_carpeta=false
+          else
+              id="${entrada}"; es_carpeta=false
+          fi
+
+          if [ "${es_carpeta}" = true ]; then
+              echo "Bajando la carpeta ${id}…"
+              python3 -m gdown --folder "https://drive.google.com/drive/folders/${id}" \
+                  -O descarga/ --remaining-ok
+          else
+              echo "Bajando el archivo ${id}…"
+              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O descarga/ --remaining-ok
+          fi
+
+          # El build acepta el .nup tal cual: no hay que extraerlo. Se deja en la
+          # carpeta del juego, que es lo que recibe el script.
+          encontrado=false
+          while IFS= read -r nup; do
+              encontrado=true
+              cp -f "$nup" game_input/
+              echo "preparado: $(basename "$nup") ($(du -h "$nup" | cut -f1))"
+          done < <(find descarga -maxdepth 3 -iname '*.nup')
+
+          if [ "${encontrado}" = false ]; then
+              echo "::error::No hay ningún .nup en lo descargado. Esto hay dentro:"
+              find descarga -maxdepth 3 | head -30
+              exit 1
+          fi
+
+          rm -rf descarga
+          echo "=== carpeta del juego ==="
+          ls -lh game_input
+          df -h /
+
       - name: Comprobar archivos del juego
         run: |
           set -euo pipefail
-          if [ ! -f "$GITHUB_WORKSPACE/game_input/base/exefs/main.npdm" ]; then
-            echo "::error::Falta game_input/base/exefs/main.npdm. Añade tu paso de descarga antes de este paso."
+          if [ -f "$GITHUB_WORKSPACE/game_input/base/exefs/main.npdm" ]; then
+            echo "Dump extraído: base/exefs/main.npdm presente"
+          elif compgen -G "$GITHUB_WORKSPACE/game_input/*.nup" > /dev/null; then
+            echo "Contenedor .nup presente: $(ls "$GITHUB_WORKSPACE"/game_input/*.nup)"
+          else
+            echo "::error::No hay ni game_input/base/exefs/main.npdm ni ningún .nup en game_input"
+            ls -lh "$GITHUB_WORKSPACE/game_input" || true
             exit 1
           fi
 
