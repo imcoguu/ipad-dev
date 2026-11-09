@@ -99,11 +99,37 @@ jobs:
           fi
 
           sudo xcode-select -s "$elegido"
+          echo "XCODE_ELEGIDO=${elegido}" >> "$GITHUB_ENV"
           xcodebuild -version
           echo "--- Metal ---"
           xcrun metal --version || true
           echo "--- SDK de iPhone ---"
           xcrun --sdk iphoneos --show-sdk-version || true
+
+      - name: Liberar espacio en disco
+        run: |
+          set -euo pipefail
+          echo "--- antes ---"; df -h /
+
+          # El build necesita, a la vez: el .nup (25 GB), lo que extrae de él
+          # (25 GB) y el IPA empaquetado (otros ~20 GB). El runner no trae eso
+          # de serie, así que se quita lo que este trabajo no usa.
+          for app in /Applications/Xcode*.app; do
+              [ "$app" = "${XCODE_ELEGIDO:-}" ] && continue
+              sudo rm -rf "$app" && echo "fuera: $app"
+          done
+          rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          rm -rf ~/Library/Caches/* ~/.nuget/packages 2>/dev/null || true
+          sudo rm -rf /usr/local/share/dotnet/sdk/*/FSharp 2>/dev/null || true
+          rm -rf /Users/runner/hostedtoolcache/CodeQL 2>/dev/null || true
+
+          echo "--- después ---"; df -h /
+          libre=$(df -g / | awk 'NR==2 {print $4}')
+          echo "libre: ${libre} GB"
+          if [ "${libre}" -lt 70 ]; then
+              echo "::warning::Solo ${libre} GB libres: el build necesita unos 70"
+          fi
 
       - name: Instalar Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain
@@ -133,69 +159,46 @@ jobs:
           cd src
           . .venv/bin/activate
           cd "$GITHUB_WORKSPACE"
-          rm -rf descarga game_input
-          mkdir -p descarga game_input
 
           if [ -z "${NUP_URL:-}" ]; then
               echo "::error::Falta el secreto KID_GDRIVE_NUP_URL con el enlace del .nup"
               exit 1
           fi
 
-          # Acepta el enlace de archivo de Drive o el id a pelo.
+          rm -rf game_input
+          mkdir -p game_input
+
+          # Directo a la carpeta del juego: bajarlo a otra parte y copiarlo
+          # costaba 50 GB en disco y el runner se quedaba sin espacio.
           entrada="$(printf '%s' "${NUP_URL}" | tr -d '[:space:]')"
+          es_carpeta=false
           if [[ "${entrada}" =~ /folders/([A-Za-z0-9_-]+) ]]; then
               id="${BASH_REMATCH[1]}"; es_carpeta=true
           elif [[ "${entrada}" =~ /d/([A-Za-z0-9_-]+) ]]; then
-              id="${BASH_REMATCH[1]}"; es_carpeta=false
+              id="${BASH_REMATCH[1]}"
           elif [[ "${entrada}" =~ [?\&]id=([A-Za-z0-9_-]+) ]]; then
-              id="${BASH_REMATCH[1]}"; es_carpeta=false
+              id="${BASH_REMATCH[1]}"
           else
-              id="${entrada}"; es_carpeta=false
+              id="${entrada}"
           fi
 
           if [ "${es_carpeta}" = true ]; then
-              echo "Bajando la carpeta ${id}…"
-              python3 -m gdown --folder "https://drive.google.com/drive/folders/${id}" \
-                  -O descarga/ --remaining-ok
+              python3 -m gdown --folder "https://drive.google.com/drive/folders/${id}" -O game_input/ --remaining-ok
           else
-              echo "Bajando el archivo ${id}…"
-              # --remaining-ok es solo para carpetas: con un archivo suelto gdown
-              # lo rechaza con «unrecognized arguments».
-              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O descarga/
+              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O game_input/
           fi
 
-          # El build acepta el .nup tal cual: no hay que extraerlo. Se deja en la
-          # carpeta del juego, que es lo que recibe el script.
-          encontrado=false
-          while IFS= read -r nup; do
-              encontrado=true
-              cp -f "$nup" game_input/
-              echo "preparado: $(basename "$nup") ($(du -h "$nup" | cut -f1))"
-          done < <(find descarga -maxdepth 3 -iname '*.nup')
-
-          if [ "${encontrado}" = false ]; then
-              echo "::error::No hay ningún .nup en lo descargado. Esto hay dentro:"
-              find descarga -maxdepth 3 | head -30
-              exit 1
-          fi
-
-          rm -rf descarga
-          echo "=== carpeta del juego ==="
-          ls -lh game_input
-          df -h /
+          ls -lh game_input; du -sh game_input; df -h /
+          compgen -G "$GITHUB_WORKSPACE/game_input/*.nup" > /dev/null || {
+              echo "::error::No hay ningún .nup en game_input"; exit 1; }
 
       - name: Comprobar archivos del juego
         run: |
           set -euo pipefail
-          if [ -f "$GITHUB_WORKSPACE/game_input/base/exefs/main.npdm" ]; then
-            echo "Dump extraído: base/exefs/main.npdm presente"
-          elif compgen -G "$GITHUB_WORKSPACE/game_input/*.nup" > /dev/null; then
-            echo "Contenedor .nup presente: $(ls "$GITHUB_WORKSPACE"/game_input/*.nup)"
-          else
-            echo "::error::No hay ni game_input/base/exefs/main.npdm ni ningún .nup en game_input"
-            ls -lh "$GITHUB_WORKSPACE/game_input" || true
-            exit 1
-          fi
+          compgen -G "$GITHUB_WORKSPACE/game_input/*.nup" > /dev/null || {
+              echo "::error::Falta el .nup en game_input"; exit 1; }
+          ls -lh "$GITHUB_WORKSPACE"/game_input/*.nup
+          df -h /
 
       - name: Compilar IPA
         working-directory: src
@@ -209,6 +212,19 @@ jobs:
           if [ -n "${APP_NAME:-}" ]; then
             args+=(--app-name "$APP_NAME")
           fi
+          # El .nup y lo extraído no caben juntos. En cuanto aparece el RomFS
+          # extraído, el .nup sobra: se borra y se recuperan 25 GB. El borrado
+          # no rompe nada aunque el tool aún lo tenga abierto (el fichero sigue
+          # vivo hasta que lo cierre), así que no hay carrera.
+          (
+            while ! compgen -G "$GITHUB_WORKSPACE/game_input/*_build/extract/v*/RomFS.img" > /dev/null; do
+                sleep 15
+            done
+            sleep 20
+            rm -f "$GITHUB_WORKSPACE"/game_input/*.nup && echo "== .nup borrado tras la extracción =="
+            df -h /
+          ) &
+
           python scripts/build_ipa_from_nsp.py "$GITHUB_WORKSPACE/game_input" "${args[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Reunir IPA
@@ -221,6 +237,7 @@ jobs:
             tail -80 build.log || true
             exit 1
           fi
+          ls -lh "$ipa"; df -h /
           cp "$ipa" salida/
           ls -lh salida/
 
