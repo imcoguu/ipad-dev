@@ -31,6 +31,9 @@ defaults:
 jobs:
   build:
     name: Build unsigned iOS IPA
+    # Imagen con Xcode 27 (preview, macOS 27 de base): es la única que trae el
+    # Metal 4 que el proyecto necesita. Con macos-26 el build muere en
+    # MTL4FXTemporalScaler. Si hace falta más disco, xcode-27-xlarge.
     runs-on: xcode-27
     timeout-minutes: 350
 
@@ -156,7 +159,9 @@ jobs:
                   -O descarga/ --remaining-ok
           else
               echo "Bajando el archivo ${id}…"
-              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O descarga/ --remaining-ok
+              # --remaining-ok es solo para carpetas: con un archivo suelto gdown
+              # lo rechaza con «unrecognized arguments».
+              python3 -m gdown "https://drive.google.com/uc?id=${id}" -O descarga/
           fi
 
           # El build acepta el .nup tal cual: no hay que extraerlo. Se deja en la
